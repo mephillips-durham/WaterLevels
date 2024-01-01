@@ -1,0 +1,191 @@
+# For handling measuring stations
+
+import json
+from datetime import datetime
+import pip._vendor.requests as requests
+from .Reporter import *
+
+
+def measure_description(measure):
+    type = measure['parameterName']
+    if 'qualifier' in measure and len(measure['qualifier']):
+        type += f" ({measure['qualifier']})"
+    return type
+
+
+class Station:
+    # The next object ID to assign for the GeoData protocols
+    object_id = 1
+    
+    # Mapping from object IDs to Station objects
+    object_id_to_station = {}
+    
+    # Dictionary in which we can look up Environment Agency IDs
+    stations = {}
+
+    def __init__(self, id):
+        self._id = id
+        
+        # Set up lookup via Environment Agency ID
+        Station.stations[id] = self
+
+        # Set up GeoData object_id and lookup
+        self.object_id = Station.object_id
+        Station.object_id_to_station[Station.object_id] = self
+        Station.object_id += 1
+
+        # Initialise rest of object
+        self.measures = {}
+        self.readings = {}
+    
+    @property
+    def id(self):
+        return self._id
+    
+    def station_from_object_id(object_id):
+        """Lookup GeoData object_id and return Station object."""
+        if object_id in Station.object_id_to_station:
+            return Station.object_id_to_station[object_id]
+        return None
+
+    @classmethod
+    def ensure(cls, id):
+        if id in Station.stations:
+            return Station.stations[id]
+        new = cls.__new__(cls)
+        cls.__init__(new, id)
+        return new
+
+    @classmethod
+    def from_json(cls, station):
+        if '@id' not in station:
+            return None
+
+        # Return cached station if found
+        if station['@id'] in Station.stations:
+            return Station.stations[station['@id']]
+
+        # Create new Station object
+        new = cls.__new__(cls)
+        cls.__init__(new, station['@id'])
+        
+        name = ''
+        if 'label' in station:
+            name = station['label']
+
+        catchment = ''
+        if 'catchmentName' in station:
+            catchment = station['catchmentName']
+
+        river = ''
+        if 'riverName' in station:
+            river = station['riverName']
+
+        if river and catchment:
+            river = f"{river} ({catchment})"
+        else:
+            river += catchment
+        
+        opened = ''
+        if 'dateOpened' in station:
+            opened = station['dateOpened']
+        
+        type = ''
+        if 'measures' in station:
+            # Take the first measure for the description
+            type = measure_description(station['measures'][0])
+            
+            # Remember all the measures
+            for measure in station['measures']:
+                new_measure = {}
+                new_measure['description'] = measure_description(measure)
+                new_measure['data_found'] = False
+                if 'unitName' in measure:
+                    new_measure['unit'] = measure['unitName']
+                new.measures[measure['@id']] = new_measure
+        
+        desc = []
+        if type:
+            desc.append(type)
+        if river:
+            desc.append(river)
+        if opened:
+            desc.append(f"opened {opened}")
+        desc = "; ".join(desc)
+
+        new.lat = station['lat']
+        new.lon = station['long']
+
+        # Store the name and the description in the Station object
+        new.name = name
+        new.desc = desc
+
+        return new
+
+    def get_readings(self):        
+        # FIXME: do not fetch again if already fetched?
+        # need to:
+        # -- produce CSV or Draw file?
+        # -- open window showing all datasets fetched
+        #    -- allow selecting several and saving as CSV or Draw
+
+        # Fetch the last 100 readings
+        url = f"{self.id}/readings?_sorted&_limit=100"
+        report(url)
+
+        r = requests.get(url)
+        if r.status_code == 200:
+            # Parse the readings and store within object
+            j = json.loads(r.text)
+
+            # FIXME: for debugging - remove
+            file = open("sensor-response/json", 'w')
+            file.write(r.text)
+            file.close()
+            
+            for reading in j['items']:
+                if 'dateTime' not in reading:
+                    continue
+                if 'measure' not in reading:
+                    continue
+                if 'value' not in reading:
+                    continue
+
+                dateTime = datetime.strptime( reading['dateTime'], '%Y-%m-%dT%H:%M:%SZ')
+                if dateTime not in self.readings:
+                    self.readings[dateTime] = {}
+                
+                report(f"{dateTime} {reading['value']}")
+                self.readings[dateTime][reading['measure']] = reading['value']
+                if reading['measure'] in self.measures:
+                    self.measures[reading['measure']]['data_found'] = True
+
+        if self.readings:
+            # Build the CSV file
+            csv = []
+            measureList = sorted(self.measures.keys())
+
+            header = 'DateTime'
+            for measure_id in measureList:
+                measure = self.measures[measure_id]
+                if measure['data_found']:
+                    header += f",{measure['description']}"
+            csv.append(header)
+            report(header)
+
+            dateTimeList = sorted(self.readings.keys())
+            for dateTime in dateTimeList:
+                line = f"{dateTime}"
+                for measure_id in measureList:
+                    measure = self.measures[measure_id]
+                    if measure['data_found']:
+                        if measure_id in self.readings[dateTime]:
+                            line += f",{self.readings[dateTime][measure_id]}"
+                        else:
+                            line += ','
+                csv.append(line)
+            self.csv = bytes("\n".join(csv) + "\n", encoding='utf-8')
+        
+        if self.readings:
+            return True
+        return False

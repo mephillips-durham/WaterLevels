@@ -1,0 +1,585 @@
+# GeoData messages for use with RiscOSM
+# Largely complete: three messages and some magic missing!
+
+from riscos_toolbox.events import UserMessage
+from riscos_toolbox import Point
+from riscos_toolbox import BBox
+
+import ctypes
+from .Reporter import *
+
+class Messages:
+    OpenMap          = 0x546D0
+    DescribeMaps     = 0x546D1
+    MapInfo          = 0x546D2
+    DescribeDatasets = 0x546D3
+    DatasetDetails   = 0x546D4
+    FetchData        = 0x546D5
+    TransmitData     = 0x546D6
+    FetchFile        = 0x546D7
+    DisplayInfo      = 0x546D8
+    Status           = 0x546D9
+    Filetypes        = 0x546DA
+    SetUserPin       = 0x546DB
+    ObjectOp         = 0x546DC
+
+
+def check_point_null( point ):
+    if point.x != 0:
+        return point
+    if point.y != 0:
+        return point
+    return None
+    
+
+def check_box_empty( box ):
+    if check_point_null(box.min) is not None:
+        return box
+    if check_point_null(box.max) is not None:
+        return box
+    return None
+    
+
+def copy_string_to_offset(obj, string, offset):
+    block = ctypes.cast(ctypes.pointer(obj), ctypes.POINTER(ctypes.c_ubyte))
+    for i in range(0,min(len(string),256-offset)):
+        block[offset+i] = string[i]
+    block[255] = 0
+
+        
+class MapPositionData(ctypes.Union):
+    _fields_ = [
+        ("bbox",   BBox),
+        ("centre", Point)
+    ]
+
+
+class OpenMapMessage(UserMessage):
+    event_id = Messages.OpenMap
+    
+    _fields_ = [
+        ("_flags",             ctypes.c_uint32),
+        ("_area_of_interest",  MapPositionData),
+        ("_bearing",           ctypes.c_int32),
+        ("_window_size",       Point),
+        ("scale",              ctypes.c_uint32),
+        ("zoom",               ctypes.c_uint32),
+        ("_style_title",       ctypes.c_char*(256-60))
+    ]
+    
+    def __init__(self):
+        self._flags  = 0
+        self.bearing = 0
+        self.scale   = 0
+        self.zoom    = 0
+
+    @property
+    def flags(self):
+        return self._flags
+    
+    @flags.setter
+    def flags(self, value):
+        """Bits 0, 1, 4, 5 are set automatically."""
+        self._flags = (self._flags & 0b110011) | (value & ~0b110011)
+
+    @property
+    def bounding_box(self):
+        if self.size >= 40 and self.flags & (1<<0):
+            return check_box_empty(self._area_of_interest.bbox)
+        return None
+
+    @bounding_box.setter
+    def bounding_box(self, value):
+        if value is None:
+            if self._flags & (1<<0):
+                self._area_of_interest.bbox = BBox(0, 0, 0, 0)
+        else:
+            self._area_of_interest.bbox = value
+            self.flags |= (1<<0)
+        
+    @property
+    def map_centre(self):
+        if self.size >= 32 and not self.flags & (1<<0):
+            return self._area_of_interest.centre
+        return None
+
+    @map_centre.setter
+    def map_centre(self, value):
+        if value is None:
+            if not self._flags & (1<<0):
+                self._area_of_interest.centre = Point(0, 0)
+        else:
+            self._area_of_interest.centre = value
+            self.flags &= ~(1<<0)
+        
+    @property
+    def bearing(self):
+        if self._bearing == 0x7FFFFFFF:
+            return None
+        return self._bearing / 1000
+    
+    @bearing.setter
+    def bearing(self, value):
+        if value is None:
+            self._bearing = 0x7FFFFFFF
+        else:
+            self._bearing = int(value * 1000)
+    
+    @property
+    def window_size(self):
+        if self.size >= 52 and self.flags & (1<<1):
+            return self._window_size
+        return None
+    
+    @window_size.setter
+    def window_size(self, value):
+        if value is None:
+            self._window_size = Point(0, 0)
+            self._flags &= ~(1<<1)
+        else:
+            self._window_size = value
+            self._flags |= (1<<1)       
+
+    def set_style_title(self, style, title):
+        td = bytes('', encoding='utf-8')
+        if style is not None:
+            td += bytes(style, encoding='utf-8') + b"\x00"
+            self._flags |= (1<<4)
+        else:
+            self._flags &= ~(1<<4)
+
+        if title is not None:
+            td += bytes(title, encoding='utf-8') + b"\x00"
+            self._flags |= (1<<5)
+        else:
+            self._flags &= ~(1<<5)
+            
+        copy_string_to_offset(self, td, 60)
+        self.size = min(256, (60 + len(td) + 3) & ~3)
+    
+    @property
+    def style(self):
+        if self._flags & (1<<4):
+            return ctypes.string_at(self._style_title).decode('utf8')
+        return None
+    
+    @style.setter
+    def style(self, value):
+        self.set_style_title(value, self.title)
+    
+    @property
+    def title(self):
+        if self._flags & (1<<5):
+            offset = 60
+            if self._flags & (1<<4):
+                offset = 61 + len(self._style_title)
+            block = ctypes.pointer(ctypes.c_ubyte.from_buffer(self,offset))
+            return ctypes.string_at(block).decode('utf8')
+        else:
+            return None
+    
+    @title.setter
+    def title(self, value):
+        self.set_style_title(self.style, value)
+
+
+class DescribeMapsMessage(UserMessage):
+    event_id = Messages.DescribeMaps
+    
+    _fields_ = [
+        ("map_id", ctypes.c_uint32),
+        ("flags",  ctypes.c_uint32)
+    ]
+
+
+class MapInfoMessage(UserMessage):
+    event_id = Messages.MapInfo
+    
+    _fields_ = [
+        ("map_id",           ctypes.c_uint32),
+        ("window_handle",    ctypes.c_uint32),
+        ("bounding_box",     BBox),
+        ("map_centre",       Point),
+        ("_bearing",         ctypes.c_int32),
+        ("_map_size_draw",   Point),
+        ("_map_size_pixels", Point),
+        ("scale",            ctypes.c_uint32),
+        ("zoom",             ctypes.c_uint32),
+        ("_style",           ctypes.c_char*(256-80))
+    ]
+    
+    def __init__(self):
+        self.size = 80
+
+    @property
+    def bearing(self):
+        if self._bearing == 0x7FFFFFFF:
+            return None
+        return self._bearing / 1000
+    
+    @bearing.setter
+    def bearing(self, value):
+        if value is None:
+            self._bearing = 0x7FFFFFFF
+        else:
+            self._bearing = int(value * 1000)
+    
+    @property
+    def map_size_draw(self):
+        return check_point_null(self._map_size_draw)
+    
+    @map_size_draw.setter
+    def map_size_draw(self, value):
+        if value is None:
+            self._map_size_draw = Point(0, 0)
+        else:
+            self._map_size_draw = value   
+    
+    @property
+    def map_size_pixels(self):
+        return check_point_null(self._map_size_pixels)
+    
+    @map_size_pixels.setter
+    def map_size_pixels(self, value):
+        if value is None:
+            self._map_size_pixels = Point(0, 0)
+        else:
+            self._map_size_pixels = value
+    
+    @property
+    def style(self):
+        return ctypes.string_at(self._style).decode('utf8')
+    
+    @style.setter
+    def style(self, value):
+        td = bytes(title, encoding='utf-8') + b"\x00"
+        copy_string_to_offset(self, td, 80)
+        self.size = min(256, (80 + len(td) + 3) & ~3)
+    
+
+class DescribeDatasetsMessage(UserMessage):
+    event_id = Messages.DescribeDatasets
+    
+    _fields_ = [
+        ("_flags",             ctypes.c_uint32),
+        ("_area_of_interest",  BBox),
+        ("_data_flags",        ctypes.c_uint32),
+        ("_dataset_id",        ctypes.c_uint32)
+    ]
+    
+    @property
+    def flags(self):
+        if self.size >= 24:
+            return self._flags
+        return 0b1
+    
+    @flags.setter
+    def flags(self, value):
+        self._flags = value
+
+    @property
+    def area_of_interest(self):
+        if self.size >= 40:
+            return check_box_empty(self._area_of_interest)
+        return None
+
+    @area_of_interest.setter
+    def area_of_interest(self, value):
+        if value is None:
+            self._area_of_interest = BBox(0, 0, 0, 0)
+        else:
+            self._area_of_interest = value
+        
+    @property
+    def data_flags(self):
+        if self.size >= 44:
+            return self._data_flags
+        return 0
+
+    @data_flags.setter
+    def data_flags(self, value):
+        self._data_flags = value
+    
+    @property
+    def dataset_id(self):
+        if self.size >= 48 and self._flags & (1<<1):
+            return self._dataset_id
+        return None
+    
+    @dataset_id.setter
+    def dataset_id(self, value):
+        if value is None:
+            self._flags &= ~(1<<1)
+            self._dataset_id = 0
+        else:
+            self._flags |= (1<<1)
+            self._dataset_id = value
+
+
+class DatasetDetailsMessage(UserMessage):
+    event_id = Messages.DatasetDetails
+
+    _fields_ = [
+        ("dataset_id",        ctypes.c_int32),
+        ("_coverage",         BBox),
+        ("data_flags",        ctypes.c_uint32),
+        ("other_flags",       ctypes.c_uint32),
+        ("_title_desc",       ctypes.c_char*(256-48)) ]
+    
+    def __init__(self):
+        self.set_title_desc('','')
+
+    @property
+    def coverage(self):
+        return check_box_empty(self._coverage)
+
+    @coverage.setter
+    def coverage(self, value):
+        if value is None:
+            self._coverage = BBox(0, 0, 0, 0)
+        else:
+            self._coverage = value
+
+    def set_title_desc(self, title, desc):
+        td = bytes(title, encoding='utf-8') + b"\x00"
+        td += bytes(desc, encoding='utf-8') + b"\x00"
+        copy_string_to_offset(self, td, 48)
+        self.size = min(256, (48 + len(td) + 3) & ~3)
+    
+    @property
+    def title(self):
+        return ctypes.string_at(self._title_desc).decode('utf8')
+    
+    @title.setter
+    def title(self, value):
+        desc = self.description
+        self.set_title_desc(value, desc)
+    
+    @property
+    def description(self):
+        offset = 49 + len(self._title_desc)
+        block = ctypes.pointer(ctypes.c_ubyte.from_buffer(self,offset))
+        return ctypes.string_at(block).decode('utf8')
+    
+    @description.setter
+    def description(self, value):
+        title = self.title
+        self.set_title_desc(title, value)
+    
+
+class PositionDataXYRadius(ctypes.Structure):
+    _fields_ = [
+        ("position", Point),
+        ("radius",   ctypes.c_int32)
+    ]
+
+
+class PositionData(ctypes.Union):
+    _fields_ = [
+        ("bbox", BBox),
+        ("xy_radius", PositionDataXYRadius)
+    ]
+
+
+class FetchDataMessage(UserMessage):
+    event_id = Messages.FetchData
+    
+    _fields_ = [
+        ("map_id",             ctypes.c_uint32),
+        ("dataset_id",         ctypes.c_uint32),
+        ("object_id",          ctypes.c_uint32),
+        ("flags",              ctypes.c_uint32),
+        ("_position_data",     PositionData),
+        ("data_flags",         ctypes.c_uint32),
+        ("_search_string",     ctypes.c_uint32),
+        ("_search_string_length", ctypes.c_int32),
+        ("page_size",          ctypes.c_int32),
+        ("page_to_fetch",      ctypes.c_int32)
+    ]
+    
+    # Currently written on the assumption that this message is being
+    # received by the application and not sent. Would need setters adding.
+    @property
+    def area_of_interest(self):
+        if self.data_flags & (1<<17) == 0:
+            return check_box_empty(self._position_data.bbox)
+        return None
+
+    @property
+    def position(self):
+        if self.data_flags & (1<<17):
+            return self._position_data.xy_radius.position
+        return None
+
+    @property
+    def radius(self):
+        if self.data_flags & (1<<17):
+            return self._position_data.xy_radius.radius
+        return None
+    
+    # FIXME add search string automatically somehow?
+
+
+class TransmitDataMessage(UserMessage):
+    event_id = Messages.TransmitData
+
+    _fields_ = [
+        ("map_id",            ctypes.c_uint32),
+        ("dataset_id",        ctypes.c_uint32),
+        ("object_id",         ctypes.c_uint32),
+        ("object_type_flags", ctypes.c_uint32),
+        ("flags",             ctypes.c_uint32),
+        ("position",          Point),
+        ("altitude",          ctypes.c_int32),
+        ("timestamp",         ctypes.c_uint64),
+        ("ground_speed",      ctypes.c_int32),
+        ("_bearing",          ctypes.c_int32),
+        ("colour",            ctypes.c_uint32),
+        ("label",             ctypes.c_char*4),
+        ("_title_desc",       ctypes.c_char*180) ]
+
+    def __init__(self):
+        self.set_title_desc('','')
+
+    @property
+    def bearing(self):
+        if self._bearing == 0x7FFFFFFF:
+            return None
+        return self._bearing / 1000
+    
+    @bearing.setter
+    def bearing(self, value):
+        if value is None:
+            self._bearing = 0x7FFFFFFF
+        else:
+            self._bearing = int(value * 1000)
+    
+    def set_title_desc(self, title, desc):
+        td = bytes(title, encoding='utf-8') + b"\x00"
+        td += bytes(desc, encoding='utf-8') + b"\x00"
+        copy_string_to_offset(self, td, 76)
+        self.size = min(256, (76 + len(td) + 3) & ~3)
+    
+    @property
+    def title(self):
+        return ctypes.string_at(self._title_desc).decode('utf8')
+    
+    @title.setter
+    def title(self, value):
+        desc = self.description
+        self.set_title_desc(value, desc)
+    
+    @property
+    def description(self):
+        offset = 77 + len(self._title_desc)
+        block = ctypes.pointer(ctypes.c_ubyte.from_buffer(self,offset))
+        return ctypes.string_at(block).decode('utf8')
+    
+    @description.setter
+    def description(self, value):
+        title = self.title
+        self.set_title_desc(title, value)
+
+# Missing: FetchFileMessage
+
+class DisplayInfoMessage(UserMessage):
+    event_id = Messages.DisplayInfo
+    
+    _fields_ = [
+        ("map_id",            ctypes.c_uint32),
+        ("dataset_id",        ctypes.c_uint32),
+        ("object_id",         ctypes.c_uint32),
+        ("flags",             ctypes.c_uint32),
+        ("_position",         Point),
+        ("_bearing",          ctypes.c_int32),
+        ("reserved1",         ctypes.c_int32),
+        ("reserved2",         ctypes.c_int32),
+        ("_location_name",    ctypes.c_char*(256-56))
+    ]
+    
+    def __init__(self):
+        self.location_name = ''
+        self.flags         = 0
+
+    @property
+    def position(self):
+        if self.flags & 1<<16:
+            return self._position
+        return None
+    
+    @position.setter
+    def position(self, value):
+        if value is None:
+            self._position = Point(0, 0)
+            self.flags &= ~(1<<16)
+        else:
+            self._position = value
+            self.flags |= (1<<16)    
+
+    @property
+    def bearing(self):
+        if self.flags & 1<<21:
+            return self._bearing
+        return None
+
+    @bearing.setter
+    def bearing(self, value):
+        if value is None:
+            self._bearing = 0
+            self.flags &= ~(1<<21)
+        else:
+            self._bearing = value
+            self.flags |= (1<<21)
+
+    @property
+    def location_name(self):
+        if self.flags & 1<<24:
+            return ctypes.string_at(self._location_name).decode('utf8')
+        return None
+    
+    @location_name.setter
+    def location_name(self, value):
+        if value is None:
+            self.flags &= ~(1<<24)
+            self.size = 48
+        else:
+            val = bytes(value, encoding='utf-8')
+            self._location_name = val
+            self.flags |= 1<<24
+            self.size = min(256, (56 + len(val) + 3) & ~3)
+
+
+class StatusMessage(UserMessage):
+    event_id = Messages.Status
+    
+    _fields_ = [
+        ("status",   ctypes.c_uint32),
+        ("quantity", ctypes.c_int32),
+        ("_message", ctypes.c_char*(256-28)) ]
+    
+    def __init__(self):
+        self.message = ''
+
+    @property
+    def message(self):
+        return ctypes.string_at(self._message).decode('utf8')
+    
+    @message.setter
+    def message(self, value):
+        val = bytes(value, encoding='utf-8')
+        self._message = val
+        self.size = min(256, (28 + len(val) + 3) & ~3)
+
+# Missing: FiletypesMessage
+# Missing: SetUserPinMessage
+
+class ObjectOpMessage(UserMessage):
+    event_id = Messages.ObjectOp
+    
+    _fields_ = [
+        ("map_id",      ctypes.c_uint32),
+        ("task_handle", ctypes.c_uint32),
+        ("dataset_id",  ctypes.c_uint32),
+        ("object_id",   ctypes.c_int32),
+        ("reason_code", ctypes.c_uint32),
+    ]

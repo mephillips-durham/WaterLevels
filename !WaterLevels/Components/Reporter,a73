@@ -1,0 +1,14 @@
+# Functions to report messages via the Reporter module
+
+import swi
+import inspect
+
+def report( string ):
+    """Report a string via the Reporter module"""
+    swi.swi('Report_Text0','s',string)
+
+def report_context( string ):
+    """Report a string via the Reporter module, displaying script and function names"""
+    filename = inspect.stack()[1].filename
+    function = inspect.stack()[1].function
+    swi.swi('Report_Text0','s',f"{filename}:{function} - {string}")

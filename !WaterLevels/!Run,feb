@@ -1,0 +1,22 @@
+|
+| !WaterLevels Run file
+|
+
+Set WaterLevels$Dir <Obey$Dir>
+IconSprites <WaterLevels$Dir>.!Sprites
+
+If "<Python3$Dir>" = "" Then Error "!Python3 has not been seen."
+
+RMEnsure Window 0.00 RMLoad System:modules.toolbox.window
+RMEnsure Window 1.17 Error You need Window 1.17 or later to run WaterLevels
+RMEnsure Menu 0.00 RMLoad System:modules.toolbox.menu
+RMEnsure Menu 0.13 Error You need Menu 0.13 or later to run WaterLevels
+RMEnsure ProgInfo 0.00 RMLoad System:modules.toolbox.proginfo
+RMEnsure Proginfo 0.00 Error You need ProgInfo to run WaterLevels
+RMEnsure SaveAs 0.00 RMLoad System:modules.toolbox.saveas
+RMEnsure SaveAs 0.03 Error You need SaveAs 0.03 or later to run WaterLevels
+RMEnsure IconBar 0.00 RMLoad System:modules.toolbox.IconBar
+RMEnsure IconBar 0.00 Error You need IconBar to run WaterLevels
+
+WimpSlot -min 4M
+Run <Python3$Dir>.bin.python38 <WaterLevels$Dir>.!RunImage %*0

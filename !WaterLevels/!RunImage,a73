@@ -1,0 +1,258 @@
+import swi
+import sys
+import os
+import ctypes
+import re
+import json
+from datetime import datetime
+import pip._vendor.requests as requests
+
+import riscos_toolbox as toolbox
+from riscos_toolbox import Wimp, Point, BBox
+
+from riscos_toolbox.objects.menu import Menu
+from riscos_toolbox.objects.window import Window
+from riscos_toolbox.objects.proginfo import ProgInfo
+from riscos_toolbox.objects.saveas import SaveAs
+from riscos_toolbox.objects.quit import Quit
+from riscos_toolbox.gadgets.button import Button
+from riscos_toolbox.gadgets.optionbutton import OptionButton
+from riscos_toolbox.application import Application
+from riscos_toolbox.wimp_events.mouse_click import MouseClick
+from riscos_toolbox.events import toolbox_handler, wimp_handler, message_handler
+import Components.GeoData as GeoData
+from Components.Station import Station
+from Components.Reporter import *
+
+ten_million = 10000000
+
+# UK bounding box, excluding Channel Islands
+bounding_box = BBox(
+    int(-8.18647 * ten_million),
+    int(49.86559 * ten_million),
+    int( 1.76739 * ten_million),
+    int(60.86956 * ten_million)
+)
+
+# Global variables for handling dataset and objects
+dataset_id = 1
+object_id = 1
+id_to_num = {}
+num_to_id = {}
+
+
+def send_user_message(message, task=0, your_ref=0, size=-1):    
+    """Send a wimp message. Updates size, code and your_ref"""
+    if size == -1:
+        if not message.size:
+            message.size = ctypes.sizeof(message)
+    else:
+        message.size = size
+    message.code = message.__class__.event_id
+    message.your_ref = your_ref
+    swi.swi("Wimp_SendMessage", "iIi",
+            Wimp.UserMessage, ctypes.addressof(message), task)
+
+
+def box_overlaps( box1, box2 ):
+    if box1.max.x <= box2.min.x:
+        return False
+    if box2.max.x <= box1.min.x:
+        return False
+    if box1.max.y <= box2.min.y:
+        return False
+    if box2.max.y <= box1.min.y:
+        return False
+    return True
+
+
+def declare_datasets( task, overlaps ):
+    message = GeoData.DatasetDetailsMessage()
+    message.dataset_id = dataset_id
+    message.coverage   = bounding_box
+    message.data_flags = (1<<16) | (1<<2)
+    if overlaps:
+        message.other_flags = (1<<4) | (1<<0)
+    else:
+        message.other_flags = (1<<4)
+
+    message.title       = "Water levels"
+    message.description = "Water level readings from the Environment Agency"
+    
+    send_user_message(message, task)
+
+
+def transmit_data( request, object_id, name, type, lon, lat):
+    message = GeoData.TransmitDataMessage()
+    message.map_id            = request.map_id
+    message.dataset_id        = dataset_id    
+    message.object_id         = object_id
+    message.object_type_flags = 0b100
+    message.flags             = (1<<3) | (1<<16) | (1<<24) | (1<<25)
+    message.position.x        = int(lon * ten_million) 
+    message.position.y        = int(lat * ten_million)
+    message.title             = name
+    message.description       = type
+
+    send_user_message(message, request.sender, request.my_ref)
+
+
+def send_status( request, status, quantity, message ):
+    m = GeoData.StatusMessage()
+    m.status   = status
+    m.quantity = quantity
+    m.message  = message
+
+    send_user_message(m, request.sender, request.my_ref)
+
+
+class IbarMenu(Menu):
+    template = "IconbarMenu"
+
+
+class SaveCSV(SaveAs):
+    # FIXME:
+    # Is not closing window after saving. (seems to be now?!)
+    # Click on Save without full path and box closes with no error.
+    # Need to convert ordinary to hard spaces in filename.
+    template = "SaveCSV"
+    
+    def __init__(self, *args):
+        super().__init__(*args)
+        report(f"Created SaveCSV with id={hex(self.id)}")
+
+
+class SaveCSVWindow(Window):
+    template = "SaveCSV2"
+    
+    def __init__(self, *args):
+        super().__init__(*args)
+        report(f"Created SaveCSVWindow with id={hex(self.id)}")
+
+
+class WaterLevels(Application):
+    def __init__(self):
+        super().__init__('<WaterLevels$Dir>')
+        declare_datasets( 0, True )
+        self.saveBox = toolbox.create_object(SaveCSV.template, SaveCSV)
+        self.saveWin = toolbox.create_object(SaveCSVWindow.template, SaveCSVWindow)
+
+
+    @toolbox_handler(Quit.Quit)
+    def quit(self, event, id_block, poll_block):
+        toolbox.quit()
+
+
+    @toolbox_handler(ProgInfo.AboutToBeShown)
+    def proginfo_show(self, event, id_block, poll_block):
+        toolbox.get_object(id_block.self.id).version = \
+            toolbox.msgtrans_lookup("Version")
+
+
+    @message_handler(GeoData.DescribeDatasetsMessage)
+    def selector_response(self, code, id_block, message):
+        # Check if interested in fixed point data
+        if message.data_flags != 0 and message.data_flags & 0b100 == 0:
+            return False
+
+        # Has the requester asked for information on all datasets?
+        all_areas = message.flags & 0b1
+        
+        overlaps = False
+        if message.area_of_interest is None:
+            all_areas = 1
+        else:
+            overlaps = box_overlaps( message.area_of_interest, bounding_box )
+
+        # Exit if requester does not want datasets outside area of interest
+        if not all_areas and not overlaps:
+            return False
+        
+        declare_datasets( message.sender, overlaps )
+        
+        return False  # Allow other handlers a look-in too
+
+    
+    @message_handler(GeoData.FetchDataMessage)
+    def selector_response(self, code, id_block, message):
+        global object_id
+
+        if message.dataset_id != dataset_id:
+            return False  # Requested wrong dataset
+            
+        if message.object_id != 0:
+            return False  # Requesting specific object (not supported)
+        
+        position = message.position        
+        if position is None:
+            return False  # No centre point supplied
+        radius = message.radius / 1000
+        
+        df = message.data_flags & ((1<<16) - 1)
+        if df != 0 and not df & 0b100:
+            return False  # Not interested in fixed points
+            
+        lat = position.y / ten_million
+        lon = position.x / ten_million
+        
+        url = f"http://environment.data.gov.uk/flood-monitoring/id/stations?lat={lat}&long={lon}&dist={radius}"
+        
+        r = requests.get(url)
+        if r.status_code == 200:
+            # FIXME: for debugging - remove
+            file = open("api-response", 'w')
+            file.write(r.text)
+            file.close()
+
+            j = json.loads(r.text)
+            stations = j['items']
+            if len(stations):
+                send_status(message, 2, len(stations), f"Found {len(stations)} measuring stations")
+            else:
+                send_status(message, 6, 0, "No measuring stations found")
+            for station in stations:
+                 new = Station.from_json( station )
+                 transmit_data(message, new.object_id, new.name, new.desc, new.lon, new.lat)
+        else:
+            send_status(message, 5, 0, f"Error from server: {r.status_code} {r.reason}")
+
+        return False  # Allow other handlers a look-in too
+
+
+    @message_handler(GeoData.DisplayInfoMessage)
+    def selector_response(self, code, id_block, message):
+        report("DisplayInfo received")
+        if message.dataset_id != dataset_id:
+            return False  # Requested wrong dataset
+            
+        station = Station.station_from_object_id(message.object_id)
+        if station is None:
+            return False  # Unknown object
+        
+        report("Object known");
+        if station.get_readings():
+            report("Finished getting readings")
+            
+            # Do ctypes gymnastics to get start address of data as int.
+            dataptr = ctypes.c_char_p(station.csv)
+            addr = ctypes.cast(dataptr, ctypes.c_void_p).value
+            
+            # Create an option button gadget
+            gadget = OptionButton(self.saveWin, 0x555)
+            #gadget = OptionButton()
+            #gadget.label = station.name
+            #gadget.state = True
+            self.saveWin.add_gadget(gadget)
+            
+            # Set SaveAs box data address, so saving can be done by Toolbox.
+            self.saveBox.set_data_address(addr, len(station.csv), 0, 0)
+            self.saveBox.file_type = 0xDFE
+            self.saveBox.file_name = station.name            
+            self.saveBox.show()
+        else:
+            report("Failed to get readings")
+        
+
+if __name__ == "__main__":
+    app = WaterLevels()
+    app.run()

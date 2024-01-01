@@ -1,0 +1,6 @@
+|
+| !WaterLevels Boot file
+|
+
+if "<WaterLevels$Dir>" = "" then set WaterLevels$Dir <Obey$Dir>
+IconSprites <WaterLevels$Dir>.!Sprites
